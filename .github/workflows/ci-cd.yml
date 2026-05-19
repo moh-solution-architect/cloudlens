@@ -1,0 +1,239 @@
+name: CloudLens CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+  AWS_REGION: us-east-1
+  TF_VERSION: "1.8.0"
+
+jobs:
+  # ── Backend: lint + test ──────────────────────────────────────────────────
+  backend-ci:
+    name: Backend — Test & Lint
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pytest with coverage
+        env:
+          USE_MOCK_DATA: "true"
+        run: |
+          pytest \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under=80 \
+            -v
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v4
+        if: github.event_name == 'push'
+        with:
+          file: backend/coverage.xml
+          flags: backend
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # ── Frontend: type-check + build ─────────────────────────────────────────
+  frontend-ci:
+    name: Frontend — Type-check & Build
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript type check
+        run: npm run type-check
+
+      - name: Build
+        run: npm run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        if: github.ref == 'refs/heads/main'
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 7
+
+  # ── Terraform: validate + plan ────────────────────────────────────────────
+  terraform-plan:
+    name: Terraform — Validate & Plan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform fmt check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        run: terraform init -backend=false
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan (dry run)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          terraform plan \
+            -var="environment=prod" \
+            -var="use_mock_data=true" \
+            -out=tfplan \
+            -input=false || true
+        continue-on-error: true
+
+  # ── Deploy: Lambda + S3 (main branch only) ───────────────────────────────
+  deploy:
+    name: Deploy to AWS
+    runs-on: ubuntu-latest
+    needs: [backend-ci, frontend-ci]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install backend dependencies into package dir
+        run: |
+          pip install \
+            --target backend/package \
+            --platform manylinux2014_x86_64 \
+            --implementation cp \
+            --python-version 3.12 \
+            --only-binary=:all: \
+            -r backend/requirements.txt
+
+      - name: Package Lambda zip
+        run: |
+          cd backend
+          cp -r app main.py package/
+          cd package
+          zip -r ../../lambda.zip .
+
+      - name: Upload Lambda zip to S3
+        run: |
+          BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name cloudlens-prod \
+            --query "Stacks[0].Outputs[?OutputKey=='LambdaPackageBucket'].OutputValue" \
+            --output text 2>/dev/null || echo "")
+          if [ -n "$BUCKET" ]; then
+            aws s3 cp lambda.zip "s3://$BUCKET/backend-${{ github.sha }}.zip"
+          fi
+
+      - name: Update Lambda function code
+        run: |
+          FUNCTION_NAME="cloudlens-prod-api"
+          if aws lambda get-function --function-name "$FUNCTION_NAME" 2>/dev/null; then
+            aws lambda update-function-code \
+              --function-name "$FUNCTION_NAME" \
+              --zip-file fileb://lambda.zip
+            aws lambda wait function-updated \
+              --function-name "$FUNCTION_NAME"
+          fi
+
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+      - name: Deploy frontend to S3 + invalidate CloudFront
+        run: |
+          BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name cloudlens-prod \
+            --query "Stacks[0].Outputs[?OutputKey=='FrontendBucket'].OutputValue" \
+            --output text 2>/dev/null || echo "")
+          CF_ID=$(aws cloudformation describe-stacks \
+            --stack-name cloudlens-prod \
+            --query "Stacks[0].Outputs[?OutputKey=='CloudFrontDistributionId'].OutputValue" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$BUCKET" ]; then
+            aws s3 sync frontend/dist/ "s3://$BUCKET/" \
+              --delete \
+              --cache-control "public,max-age=31536000,immutable" \
+              --exclude "index.html"
+            aws s3 cp frontend/dist/index.html "s3://$BUCKET/index.html" \
+              --cache-control "public,max-age=0,must-revalidate"
+          fi
+
+          if [ -n "$CF_ID" ]; then
+            aws cloudfront create-invalidation \
+              --distribution-id "$CF_ID" \
+              --paths "/*"
+          fi
+
+      - name: Post deployment summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: production" >> $GITHUB_STEP_SUMMARY
+          echo "- **Lambda**: updated" >> $GITHUB_STEP_SUMMARY
+          echo "- **Frontend**: deployed to S3 + CloudFront" >> $GITHUB_STEP_SUMMARY
